@@ -1,0 +1,142 @@
+name: "Auto-Register Terraform Module in Lace"
+description: "Validates a Terraform module and registers it in the Lace Terraform Registry"
+author: "Lace"
+branding:
+  icon: "package"
+  color: "purple"
+
+# Inputs that the calling workflow must provide
+inputs:
+  module-path:
+    description: "Path to the Terraform module directory (e.g. modules/aws-s3-bucket)"
+    required: true
+  lace-github-token:
+    description: "GitHub token (a PAT) used to authenticate with Lace. Must have read:user and user:email scopes."
+    required: true
+
+# Outputs that the action will expose back to the workflow
+outputs:
+  module-name:
+    description: "Name of the module that was registered"
+    value: ${{ steps.verify.outputs.module_name }}
+  module-system:
+    description: "System of the module that was registered"
+    value: ${{ steps.verify.outputs.module_system }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate module structure
+      id: validate
+      shell: bash
+      run: |
+        MODULE_PATH="${{ inputs.module-path }}"
+        echo "🔍 Validating module at: $MODULE_PATH"
+
+        if [ ! -d "$MODULE_PATH" ]; then
+          echo "❌ ERROR: Module path '$MODULE_PATH' does not exist or is not a directory." >&2
+          exit 1
+        fi
+
+        if [ ! -f "$MODULE_PATH/module.yaml" ]; then
+          echo "❌ ERROR: module.yaml not found in $MODULE_PATH" >&2
+          exit 1
+        fi
+
+        if [ ! -f "$MODULE_PATH/main.tf" ]; then
+          echo "❌ ERROR: main.tf not found in $MODULE_PATH" >&2
+          exit 1
+        fi
+
+        echo "✅ Module structure looks valid"
+
+    - name: Download Lace CLI
+      id: install-lace
+      shell: bash
+      run: |
+        echo "📥 Downloading Lace CLI..."
+        wget https://releases.lace.cloud/lace-cli-linux-amd64 -O lace
+
+        chmod +x lace
+        sudo mv lace /usr/local/bin/lace
+
+        echo "✅ Lace CLI installed"
+        lace help || true
+
+    - name: Authenticate with Lace
+      id: lace-auth
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.lace-github-token }}
+      run: |
+        echo "🔐 Authenticating with Lace platform..."
+
+        if [ -z "$GITHUB_TOKEN" ]; then
+          echo "❌ ERROR: lace-github-token input was not provided (or resolved to empty)." >&2
+          echo "Make sure you call this action like:"
+          echo "  with:"
+          echo "    lace-github-token: \${{ secrets.LACE_GITHUB_TOKEN }}"
+          exit 1
+        fi
+
+        # Exchange GitHub token for a Lace session/API key
+        lace login --token "$GITHUB_TOKEN"
+
+        echo "✅ Authentication successful"
+        lace whoami || true
+
+    - name: Register module with Lace
+      id: register
+      shell: bash
+      run: |
+        MODULE_PATH="${{ inputs.module-path }}"
+
+        echo "📦 Registering module: $MODULE_PATH"
+        echo "Commit SHA: ${{ github.sha }}"
+        echo "Git ref:    ${{ github.ref }}"
+
+        lace terraform-registry register \
+          --module-path "$MODULE_PATH" \
+          --commit-sha "${{ github.sha }}" \
+          --ref "${{ github.ref }}"
+
+        echo "✅ Module registration complete"
+
+    - name: Verify registration
+      id: verify
+      shell: bash
+      run: |
+        MODULE_PATH="${{ inputs.module-path }}"
+
+        echo "🔍 Verifying module registration..."
+
+        # Extract module name and system from module.yaml
+        MODULE_NAME=$(grep -A 1 "^module:" "$MODULE_PATH/module.yaml" | grep "name:" | cut -d':' -f2 | tr -d '[:space:]')
+        MODULE_SYSTEM=$(grep -A 2 "^module:" "$MODULE_PATH/module.yaml" | grep "system:" | cut -d':' -f2 | tr -d '[:space:]')
+
+        if [ -z "$MODULE_NAME" ] || [ -z "$MODULE_SYSTEM" ]; then
+          echo "❌ ERROR: Could not extract module.name or module.system from $MODULE_PATH/module.yaml" >&2
+          exit 1
+        fi
+
+        echo "Module identified as: $MODULE_SYSTEM/$MODULE_NAME"
+
+        # Call Lace to list/confirm the module after registration
+        lace terraform-registry get "$MODULE_NAME" "$MODULE_SYSTEM"
+
+        # Expose outputs for downstream steps in the caller workflow
+        echo "module_name=$MODULE_NAME" >> $GITHUB_OUTPUT
+        echo "module_system=$MODULE_SYSTEM" >> $GITHUB_OUTPUT
+
+        echo "✅ Module verified in registry"
+
+    - name: Cleanup Lace credentials
+      # Composite actions support `if:` on steps; we still run this even if previous step failed.
+      if: always()
+      shell: bash
+      run: |
+        echo "🧹 Cleaning up Lace credentials..."
+        lace logout || true
+        rm -rf ~/.config/lace || true
+
+        echo "🧽 Cleanup complete"
